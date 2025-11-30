@@ -27,6 +27,15 @@ type UI struct {
 	currentView string // Track current resource view
 }
 
+const (
+	tableStatusText = "[yellow]1[white]:containers [yellow]2[white]:images [yellow]3[white]:networks [yellow]4[white]:volumes | [yellow]s[white]:start [yellow]x[white]:stop [yellow]d[white]:delete [yellow]q[white]:quit"
+	logsStatusText  = "[yellow]ESC/q[white]:back [yellow]↑↓[white]:scroll"
+	containersTitle = " Docker Containers (dock-it) "
+	imagesTitle     = " Docker Images "
+	networksTitle   = " Docker Networks "
+	volumesTitle    = " Docker Volumes "
+)
+
 // NewUI creates a new UI instance with the provided Docker client
 func NewUI(docker *DockerClient) *UI {
 	return &UI{
@@ -43,7 +52,7 @@ func (u *UI) Initialize() {
 		SetBorders(false).
 		SetSelectable(true, false).
 		SetFixed(1, 0)
-	u.table.SetTitle(" Docker Containers (dock-it) ").SetBorder(true)
+	u.table.SetTitle(containersTitle).SetBorder(true)
 
 	u.logsView = tview.NewTextView().
 		SetDynamicColors(true).
@@ -54,8 +63,8 @@ func (u *UI) Initialize() {
 	u.logsView.SetTitle(" Container Logs ").SetBorder(true)
 
 	u.statusBar = tview.NewTextView().
-		SetDynamicColors(true).
-		SetText("[yellow]1[white]:containers [yellow]2[white]:images [yellow]3[white]:networks [yellow]4[white]:volumes | [yellow]s[white]:start [yellow]x[white]:stop [yellow]d[white]:delete [yellow]q[white]:quit")
+		SetDynamicColors(true)
+	u.updateStatusBarText()
 
 	u.setupKeyBindings()
 	u.loadContainers()
@@ -63,49 +72,36 @@ func (u *UI) Initialize() {
 
 func (u *UI) setupKeyBindings() {
 	u.table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		// View switching
-		if event.Rune() == '1' {
+		switch event.Rune() {
+		case '1':
 			u.currentView = "containers"
-			go func() {
-				u.app.QueueUpdateDraw(func() {
-					u.loadContainers()
-				})
-			}()
+			u.loadContainers()
 			return nil
-		} else if event.Rune() == '2' {
+		case '2':
 			u.currentView = "images"
-			go func() {
-				u.app.QueueUpdateDraw(func() {
-					u.loadImages()
-				})
-			}()
+			u.loadImages()
 			return nil
-		} else if event.Rune() == '3' {
+		case '3':
 			u.currentView = "networks"
-			go func() {
-				u.app.QueueUpdateDraw(func() {
-					u.loadNetworks()
-				})
-			}()
+			u.loadNetworks()
 			return nil
-		} else if event.Rune() == '4' {
+		case '4':
 			u.currentView = "volumes"
-			go func() {
-				u.app.QueueUpdateDraw(func() {
-					u.loadVolumes()
-				})
-			}()
+			u.loadVolumes()
+			return nil
+		case 'R':
+			u.reloadCurrentView()
+			return nil
+		case 'q':
+			u.app.Stop()
 			return nil
 		}
 
-		// Container-specific actions
-		if u.currentView == "containers" {
+		switch u.currentView {
+		case "containers":
 			row, _ := u.table.GetSelection()
 			idx := row - 1
 			if idx < 0 || idx >= len(u.containers) {
-				if event.Rune() == 'q' {
-					u.app.Stop()
-				}
 				return event
 			}
 
@@ -114,40 +110,51 @@ func (u *UI) setupKeyBindings() {
 			switch event.Rune() {
 			case 's':
 				if selectedContainer.State != "running" {
-					u.docker.StartContainer(selectedContainer.ID)
-					u.loadContainers()
+					u.runAsyncAction(fmt.Sprintf("Start %s", selectedContainer.Name), func() error {
+						return u.docker.StartContainer(selectedContainer.ID)
+					}, func() {
+						u.loadContainers()
+					})
 				}
+				return nil
 			case 'x':
 				if selectedContainer.State == "running" {
-					u.docker.StopContainer(selectedContainer.ID)
-					u.loadContainers()
+					u.runAsyncAction(fmt.Sprintf("Stop %s", selectedContainer.Name), func() error {
+						return u.docker.StopContainer(selectedContainer.ID)
+					}, func() {
+						u.loadContainers()
+					})
 				}
+				return nil
 			case 'r':
-				u.docker.RestartContainer(selectedContainer.ID)
-				u.loadContainers()
+				u.runAsyncAction(fmt.Sprintf("Restart %s", selectedContainer.Name), func() error {
+					return u.docker.RestartContainer(selectedContainer.ID)
+				}, func() {
+					u.loadContainers()
+				})
+				return nil
 			case 'd':
 				if selectedContainer.State != "running" {
-					u.docker.RemoveContainer(selectedContainer.ID)
-					u.loadContainers()
+					u.runAsyncAction(fmt.Sprintf("Remove %s", selectedContainer.Name), func() error {
+						return u.docker.RemoveContainer(selectedContainer.ID)
+					}, func() {
+						u.loadContainers()
+					})
 				}
+				return nil
 			case 'l':
 				u.showLogs(selectedContainer)
+				return nil
 			case 'e':
 				if selectedContainer.State == "running" {
 					u.execContainer(selectedContainer)
 				}
-			case 'R':
-				u.loadContainers()
-			case 'q':
-				u.app.Stop()
+				return nil
 			}
-		} else if u.currentView == "images" {
+		case "images":
 			row, _ := u.table.GetSelection()
 			idx := row - 1
 			if idx < 0 || idx >= len(u.images) {
-				if event.Rune() == 'q' {
-					u.app.Stop()
-				}
 				return event
 			}
 
@@ -155,20 +162,17 @@ func (u *UI) setupKeyBindings() {
 
 			switch event.Rune() {
 			case 'd':
-				u.docker.RemoveImage(selectedImage.ID)
-				u.loadImages()
-			case 'R':
-				u.loadImages()
-			case 'q':
-				u.app.Stop()
+				u.runAsyncAction(fmt.Sprintf("Remove image %s", selectedImage.ID), func() error {
+					return u.docker.RemoveImage(selectedImage.ID)
+				}, func() {
+					u.loadImages()
+				})
+				return nil
 			}
-		} else if u.currentView == "networks" {
+		case "networks":
 			row, _ := u.table.GetSelection()
 			idx := row - 1
 			if idx < 0 || idx >= len(u.networks) {
-				if event.Rune() == 'q' {
-					u.app.Stop()
-				}
 				return event
 			}
 
@@ -176,20 +180,17 @@ func (u *UI) setupKeyBindings() {
 
 			switch event.Rune() {
 			case 'd':
-				u.docker.RemoveNetwork(selectedNetwork.ID)
-				u.loadNetworks()
-			case 'R':
-				u.loadNetworks()
-			case 'q':
-				u.app.Stop()
+				u.runAsyncAction(fmt.Sprintf("Remove network %s", selectedNetwork.Name), func() error {
+					return u.docker.RemoveNetwork(selectedNetwork.ID)
+				}, func() {
+					u.loadNetworks()
+				})
+				return nil
 			}
-		} else if u.currentView == "volumes" {
+		case "volumes":
 			row, _ := u.table.GetSelection()
 			idx := row - 1
 			if idx < 0 || idx >= len(u.volumes) {
-				if event.Rune() == 'q' {
-					u.app.Stop()
-				}
 				return event
 			}
 
@@ -197,12 +198,12 @@ func (u *UI) setupKeyBindings() {
 
 			switch event.Rune() {
 			case 'd':
-				u.docker.RemoveVolume(selectedVolume.Name)
-				u.loadVolumes()
-			case 'R':
-				u.loadVolumes()
-			case 'q':
-				u.app.Stop()
+				u.runAsyncAction(fmt.Sprintf("Remove volume %s", selectedVolume.Name), func() error {
+					return u.docker.RemoveVolume(selectedVolume.Name)
+				}, func() {
+					u.loadVolumes()
+				})
+				return nil
 			}
 		}
 
@@ -222,19 +223,74 @@ func (u *UI) setupKeyBindings() {
 	})
 }
 
+func (u *UI) setStatusMessage(msg string) {
+	u.statusBar.SetText(msg)
+}
+
+func (u *UI) updateStatusBarText() {
+	if u.viewMode == "logs" {
+		u.statusBar.SetText(logsStatusText)
+		return
+	}
+	u.statusBar.SetText(tableStatusText)
+}
+
+func (u *UI) runAsyncAction(actionLabel string, action func() error, onSuccess func()) {
+	u.setStatusMessage(fmt.Sprintf("[yellow]%s...", actionLabel))
+	go func() {
+		err := action()
+		u.app.QueueUpdateDraw(func() {
+			if err != nil {
+				u.statusBar.SetText(fmt.Sprintf("[red]%s failed: %v", actionLabel, err))
+				return
+			}
+			if onSuccess != nil {
+				onSuccess()
+			}
+			u.updateStatusBarText()
+		})
+	}()
+}
+
+func (u *UI) showLoading(title string) {
+	u.table.Clear()
+	u.table.SetTitle(title)
+	u.table.SetCell(0, 0, tview.NewTableCell("Loading...").
+		SetSelectable(false).
+		SetTextColor(tcell.ColorGray))
+}
+
+func (u *UI) reloadCurrentView() {
+	switch u.currentView {
+	case "containers":
+		u.loadContainers()
+	case "images":
+		u.loadImages()
+	case "networks":
+		u.loadNetworks()
+	case "volumes":
+		u.loadVolumes()
+	}
+}
+
 func (u *UI) showLogs(container ContainerInfo) {
 	u.logsView.Clear()
 	u.logsView.SetTitle(fmt.Sprintf(" Logs: %s ", container.Name))
+	u.logsView.SetText("Loading logs...")
 
-	logs, err := u.docker.GetContainerLogs(container.ID, "100")
-	if err != nil {
-		u.logsView.SetText(fmt.Sprintf("[red]Error fetching logs: %v", err))
-	} else {
-		u.logsView.SetText(logs)
-	}
+	go func() {
+		logs, err := u.docker.GetContainerLogs(container.ID, "100")
+		u.app.QueueUpdateDraw(func() {
+			if err != nil {
+				u.logsView.SetText(fmt.Sprintf("[red]Error fetching logs: %v", err))
+				return
+			}
+			u.logsView.SetText(logs)
+		})
+	}()
 
 	u.viewMode = "logs"
-	u.statusBar.SetText("[yellow]ESC/q[white]:back [yellow]↑↓[white]:scroll")
+	u.updateStatusBarText()
 
 	u.mainView.Clear()
 	u.mainView.AddItem(u.logsView, 0, 1, true)
@@ -245,14 +301,14 @@ func (u *UI) showLogs(container ContainerInfo) {
 
 func (u *UI) switchToTableView() {
 	u.viewMode = "containers"
-	u.statusBar.SetText("[yellow]1[white]:containers [yellow]2[white]:images [yellow]3[white]:networks [yellow]4[white]:volumes | [yellow]s[white]:start [yellow]x[white]:stop [yellow]d[white]:delete [yellow]q[white]:quit")
+	u.updateStatusBarText()
 
 	u.mainView.Clear()
 	u.mainView.AddItem(u.table, 0, 1, true)
 	u.mainView.AddItem(u.statusBar, 1, 0, false)
 
 	u.app.SetFocus(u.table)
-	u.loadContainers()
+	u.reloadCurrentView()
 }
 
 func (u *UI) execContainer(container ContainerInfo) {
@@ -274,10 +330,58 @@ func (u *UI) execContainer(container ContainerInfo) {
 
 func (u *UI) loadContainers() {
 	currentRow, _ := u.table.GetSelection()
-	u.table.Clear()
-	u.table.SetTitle(" Docker Containers ")
+	u.showLoading(containersTitle)
+	go func(selectedRow int) {
+		containers, err := u.docker.ListContainers()
+		u.app.QueueUpdateDraw(func() {
+			u.renderContainers(containers, err, selectedRow)
+		})
+	}(currentRow)
+}
 
-	// Set headers
+func (u *UI) loadImages() {
+	currentRow, _ := u.table.GetSelection()
+	u.showLoading(imagesTitle)
+	go func(selectedRow int) {
+		images, err := u.docker.ListImages()
+		u.app.QueueUpdateDraw(func() {
+			u.renderImages(images, err, selectedRow)
+		})
+	}(currentRow)
+}
+
+func (u *UI) loadNetworks() {
+	currentRow, _ := u.table.GetSelection()
+	u.showLoading(networksTitle)
+	go func(selectedRow int) {
+		networks, err := u.docker.ListNetworks()
+		u.app.QueueUpdateDraw(func() {
+			u.renderNetworks(networks, err, selectedRow)
+		})
+	}(currentRow)
+}
+
+func (u *UI) loadVolumes() {
+	currentRow, _ := u.table.GetSelection()
+	u.showLoading(volumesTitle)
+	go func(selectedRow int) {
+		volumes, err := u.docker.ListVolumes()
+		u.app.QueueUpdateDraw(func() {
+			u.renderVolumes(volumes, err, selectedRow)
+		})
+	}(currentRow)
+}
+
+func (u *UI) renderContainers(containers []ContainerInfo, err error, selectedRow int) {
+	u.table.Clear()
+	u.table.SetTitle(containersTitle)
+	if err != nil {
+		u.table.SetCell(0, 0, tview.NewTableCell("Error: "+err.Error()).
+			SetTextColor(tcell.ColorRed))
+		return
+	}
+
+	u.containers = containers
 	headers := []string{"STATUS", "NAME", "IMAGE", "CPU", "MEMORY", "NET I/O", "PORTS"}
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
@@ -287,15 +391,6 @@ func (u *UI) loadContainers() {
 			SetExpansion(1).
 			SetAttributes(tcell.AttrBold))
 	}
-
-	containers, err := u.docker.ListContainers()
-	if err != nil {
-		u.table.SetCell(1, 0, tview.NewTableCell("Error: "+err.Error()).
-			SetTextColor(tcell.ColorRed))
-		return
-	}
-
-	u.containers = containers
 
 	for i, c := range containers {
 		statusSymbol := "●"
@@ -331,20 +426,19 @@ func (u *UI) loadContainers() {
 			SetExpansion(1))
 	}
 
-	// Restore cursor position
-	if currentRow > 0 && currentRow <= len(u.containers) {
-		u.table.Select(currentRow, 0)
-	} else if len(u.containers) > 0 {
-		u.table.Select(1, 0)
-	}
+	u.restoreSelection(selectedRow, len(containers))
 }
 
-func (u *UI) loadImages() {
-	currentRow, _ := u.table.GetSelection()
+func (u *UI) renderImages(images []ImageInfo, err error, selectedRow int) {
 	u.table.Clear()
-	u.table.SetTitle(" Docker Images ")
+	u.table.SetTitle(imagesTitle)
+	if err != nil {
+		u.table.SetCell(0, 0, tview.NewTableCell("Error: "+err.Error()).
+			SetTextColor(tcell.ColorRed))
+		return
+	}
 
-	// Set headers
+	u.images = images
 	headers := []string{"ID", "TAG", "SIZE", "CREATED"}
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
@@ -354,15 +448,6 @@ func (u *UI) loadImages() {
 			SetExpansion(1).
 			SetAttributes(tcell.AttrBold))
 	}
-
-	images, err := u.docker.ListImages()
-	if err != nil {
-		u.table.SetCell(1, 0, tview.NewTableCell("Error: "+err.Error()).
-			SetTextColor(tcell.ColorRed))
-		return
-	}
-
-	u.images = images
 
 	for i, img := range images {
 		row := i + 1
@@ -380,19 +465,19 @@ func (u *UI) loadImages() {
 			SetExpansion(1))
 	}
 
-	if currentRow > 0 && currentRow <= len(u.images) {
-		u.table.Select(currentRow, 0)
-	} else if len(u.images) > 0 {
-		u.table.Select(1, 0)
-	}
+	u.restoreSelection(selectedRow, len(images))
 }
 
-func (u *UI) loadNetworks() {
-	currentRow, _ := u.table.GetSelection()
+func (u *UI) renderNetworks(networks []NetworkInfo, err error, selectedRow int) {
 	u.table.Clear()
-	u.table.SetTitle(" Docker Networks ")
+	u.table.SetTitle(networksTitle)
+	if err != nil {
+		u.table.SetCell(0, 0, tview.NewTableCell("Error: "+err.Error()).
+			SetTextColor(tcell.ColorRed))
+		return
+	}
 
-	// Set headers
+	u.networks = networks
 	headers := []string{"ID", "NAME", "DRIVER", "SCOPE"}
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
@@ -402,15 +487,6 @@ func (u *UI) loadNetworks() {
 			SetExpansion(1).
 			SetAttributes(tcell.AttrBold))
 	}
-
-	networks, err := u.docker.ListNetworks()
-	if err != nil {
-		u.table.SetCell(1, 0, tview.NewTableCell("Error: "+err.Error()).
-			SetTextColor(tcell.ColorRed))
-		return
-	}
-
-	u.networks = networks
 
 	for i, net := range networks {
 		row := i + 1
@@ -428,19 +504,19 @@ func (u *UI) loadNetworks() {
 			SetExpansion(1))
 	}
 
-	if currentRow > 0 && currentRow <= len(u.networks) {
-		u.table.Select(currentRow, 0)
-	} else if len(u.networks) > 0 {
-		u.table.Select(1, 0)
-	}
+	u.restoreSelection(selectedRow, len(networks))
 }
 
-func (u *UI) loadVolumes() {
-	currentRow, _ := u.table.GetSelection()
+func (u *UI) renderVolumes(volumes []VolumeInfo, err error, selectedRow int) {
 	u.table.Clear()
-	u.table.SetTitle(" Docker Volumes ")
+	u.table.SetTitle(volumesTitle)
+	if err != nil {
+		u.table.SetCell(0, 0, tview.NewTableCell("Error: "+err.Error()).
+			SetTextColor(tcell.ColorRed))
+		return
+	}
 
-	// Set headers
+	u.volumes = volumes
 	headers := []string{"NAME", "DRIVER", "MOUNTPOINT"}
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
@@ -450,15 +526,6 @@ func (u *UI) loadVolumes() {
 			SetExpansion(1).
 			SetAttributes(tcell.AttrBold))
 	}
-
-	volumes, err := u.docker.ListVolumes()
-	if err != nil {
-		u.table.SetCell(1, 0, tview.NewTableCell("Error: "+err.Error()).
-			SetTextColor(tcell.ColorRed))
-		return
-	}
-
-	u.volumes = volumes
 
 	for i, vol := range volumes {
 		row := i + 1
@@ -473,9 +540,16 @@ func (u *UI) loadVolumes() {
 			SetExpansion(1))
 	}
 
-	if currentRow > 0 && currentRow <= len(u.volumes) {
-		u.table.Select(currentRow, 0)
-	} else if len(u.volumes) > 0 {
+	u.restoreSelection(selectedRow, len(volumes))
+}
+
+func (u *UI) restoreSelection(selectedRow, total int) {
+	switch {
+	case total == 0:
+		u.table.Select(0, 0)
+	case selectedRow > 0 && selectedRow <= total:
+		u.table.Select(selectedRow, 0)
+	default:
 		u.table.Select(1, 0)
 	}
 }

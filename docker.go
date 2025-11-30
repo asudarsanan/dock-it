@@ -18,6 +18,12 @@ import (
 	"github.com/docker/docker/client"
 )
 
+const (
+	defaultTimeout  = 5 * time.Second
+	statsTimeout    = 2 * time.Second
+	maxStatsWorkers = 4
+)
+
 // DockerClient wraps the Docker SDK client with high-level methods
 type DockerClient struct {
 	cli *client.Client
@@ -59,6 +65,13 @@ type VolumeInfo struct {
 	Mountpoint string
 }
 
+// ContainerStats holds formatted resource usage statistics
+type ContainerStats struct {
+	CPU    string
+	Memory string
+	NetIO  string
+}
+
 // NewDockerClient creates a new Docker client using environment variables
 func NewDockerClient() (*DockerClient, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -68,16 +81,24 @@ func NewDockerClient() (*DockerClient, error) {
 	return &DockerClient{cli: cli}, nil
 }
 
+func timeoutCtx(timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
 func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
-	containers, err := d.cli.ContainerList(context.Background(), container.ListOptions{All: true})
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+
+	containers, err := d.cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
 
 	var result []ContainerInfo
-
-	// Collect running container IDs for concurrent stats fetching
-	runningContainers := make(map[string]int) // map[containerID]index
+	runningContainers := make(map[string]int)
 
 	for i, c := range containers {
 		name := "<none>"
@@ -85,10 +106,9 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 			name = strings.TrimPrefix(c.Names[0], "/")
 		}
 
-		// Format ports
-		ports := ""
+		ports := "-"
 		if len(c.Ports) > 0 {
-			portList := []string{}
+			portList := make([]string, 0, len(c.Ports))
 			for _, port := range c.Ports {
 				if port.PublicPort > 0 {
 					portList = append(portList, fmt.Sprintf("%d->%d", port.PublicPort, port.PrivatePort))
@@ -96,11 +116,7 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 			}
 			if len(portList) > 0 {
 				ports = strings.Join(portList, ", ")
-			} else {
-				ports = "-"
 			}
-		} else {
-			ports = "-"
 		}
 
 		info := ContainerInfo{
@@ -121,18 +137,20 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 		}
 	}
 
-	// Fetch stats concurrently for all running containers
 	if len(runningContainers) > 0 {
 		var wg sync.WaitGroup
 		var mu sync.Mutex
+		sem := make(chan struct{}, maxStatsWorkers)
 
 		for id, idx := range runningContainers {
 			wg.Add(1)
 			go func(containerID string, index int) {
 				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
 
-				statsCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancel()
+				statsCtx, cancelStats := timeoutCtx(statsTimeout)
+				defer cancelStats()
 
 				stats, err := d.getContainerStatsWithContext(statsCtx, containerID)
 				if err == nil {
@@ -145,17 +163,10 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 			}(id, idx)
 		}
 
-		wg.Wait() // Wait for all stats to be fetched (or timeout)
+		wg.Wait()
 	}
 
 	return result, nil
-}
-
-// ContainerStats holds formatted resource usage statistics
-type ContainerStats struct {
-	CPU    string
-	Memory string
-	NetIO  string
 }
 
 // getContainerStats fetches container stats with a default background context
@@ -166,77 +177,41 @@ func (d *DockerClient) getContainerStats(id string) (*ContainerStats, error) {
 
 // getContainerStatsWithContext fetches container stats with a provided context for timeout/cancellation
 func (d *DockerClient) getContainerStatsWithContext(ctx context.Context, id string) (*ContainerStats, error) {
-	stats, err := d.cli.ContainerStats(ctx, id, false) // false = single stat, not stream
+	statsResp, err := d.cli.ContainerStats(ctx, id, false)
 	if err != nil {
 		return nil, err
 	}
-	defer stats.Body.Close()
+	defer statsResp.Body.Close()
 
-	var v map[string]interface{}
-	if err := json.NewDecoder(stats.Body).Decode(&v); err != nil {
+	var payload container.StatsResponse
+	if err := json.NewDecoder(statsResp.Body).Decode(&payload); err != nil {
 		return nil, err
 	}
 
-	// Calculate CPU percentage
+	cpuDelta := float64(payload.CPUStats.CPUUsage.TotalUsage - payload.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(payload.CPUStats.SystemUsage - payload.PreCPUStats.SystemUsage)
+	onlineCPUs := float64(payload.CPUStats.OnlineCPUs)
+	if onlineCPUs == 0 && len(payload.CPUStats.CPUUsage.PercpuUsage) > 0 {
+		onlineCPUs = float64(len(payload.CPUStats.CPUUsage.PercpuUsage))
+	}
+
 	cpuPercent := 0.0
-	if cpuStats, ok := v["cpu_stats"].(map[string]interface{}); ok {
-		if preCpuStats, ok := v["precpu_stats"].(map[string]interface{}); ok {
-			cpuDelta := 0.0
-			systemDelta := 0.0
-
-			if cpuUsage, ok := cpuStats["cpu_usage"].(map[string]interface{}); ok {
-				if totalUsage, ok := cpuUsage["total_usage"].(float64); ok {
-					if preCpuUsage, ok := preCpuStats["cpu_usage"].(map[string]interface{}); ok {
-						if preTotalUsage, ok := preCpuUsage["total_usage"].(float64); ok {
-							cpuDelta = totalUsage - preTotalUsage
-						}
-					}
-				}
-			}
-
-			if systemUsage, ok := cpuStats["system_cpu_usage"].(float64); ok {
-				if preSystemUsage, ok := preCpuStats["system_cpu_usage"].(float64); ok {
-					systemDelta = systemUsage - preSystemUsage
-				}
-			}
-
-			if systemDelta > 0.0 && cpuDelta > 0.0 {
-				cpuPercent = (cpuDelta / systemDelta) * 100.0
-			}
-		}
+	if cpuDelta > 0 && systemDelta > 0 && onlineCPUs > 0 {
+		cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
 	}
 
-	// Calculate memory usage
-	memUsage := 0.0
-	memLimit := 0.0
-	if memStats, ok := v["memory_stats"].(map[string]interface{}); ok {
-		if usage, ok := memStats["usage"].(float64); ok {
-			memUsage = usage
-		}
-		if limit, ok := memStats["limit"].(float64); ok {
-			memLimit = limit
-		}
-	}
-
+	memUsage := float64(payload.MemoryStats.Usage)
+	memLimit := float64(payload.MemoryStats.Limit)
 	memPercent := 0.0
 	if memLimit > 0 {
 		memPercent = (memUsage / memLimit) * 100.0
 	}
 
-	// Calculate network I/O
 	rxBytes := 0.0
 	txBytes := 0.0
-	if networks, ok := v["networks"].(map[string]interface{}); ok {
-		for _, netStats := range networks {
-			if netMap, ok := netStats.(map[string]interface{}); ok {
-				if rx, ok := netMap["rx_bytes"].(float64); ok {
-					rxBytes += rx
-				}
-				if tx, ok := netMap["tx_bytes"].(float64); ok {
-					txBytes += tx
-				}
-			}
-		}
+	for _, netStats := range payload.Networks {
+		rxBytes += float64(netStats.RxBytes)
+		txBytes += float64(netStats.TxBytes)
 	}
 
 	return &ContainerStats{
@@ -247,25 +222,34 @@ func (d *DockerClient) getContainerStatsWithContext(ctx context.Context, id stri
 }
 
 func (d *DockerClient) StartContainer(id string) error {
-	return d.cli.ContainerStart(context.Background(), id, container.StartOptions{})
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+	return d.cli.ContainerStart(ctx, id, container.StartOptions{})
 }
 
 func (d *DockerClient) StopContainer(id string) error {
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
 	timeout := 10
-	return d.cli.ContainerStop(context.Background(), id, container.StopOptions{Timeout: &timeout})
+	return d.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
 }
 
 func (d *DockerClient) RestartContainer(id string) error {
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
 	timeout := 10
-	return d.cli.ContainerRestart(context.Background(), id, container.StopOptions{Timeout: &timeout})
+	return d.cli.ContainerRestart(ctx, id, container.StopOptions{Timeout: &timeout})
 }
 
 func (d *DockerClient) RemoveContainer(id string) error {
-	return d.cli.ContainerRemove(context.Background(), id, container.RemoveOptions{})
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+	return d.cli.ContainerRemove(ctx, id, container.RemoveOptions{})
 }
 
 func (d *DockerClient) GetContainerLogs(id string, tail string) (string, error) {
-	ctx := context.Background()
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
 	options := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
@@ -279,13 +263,12 @@ func (d *DockerClient) GetContainerLogs(id string, tail string) (string, error) 
 	}
 	defer out.Close()
 
-	buf := make([]byte, 1024*1024) // 1MB buffer
-	n, err := out.Read(buf)
-	if err != nil && err != io.EOF {
+	data, err := io.ReadAll(out)
+	if err != nil {
 		return "", err
 	}
 
-	return string(buf[:n]), nil
+	return string(data), nil
 }
 
 func (d *DockerClient) ExecContainer(id string) error {
@@ -293,7 +276,10 @@ func (d *DockerClient) ExecContainer(id string) error {
 }
 
 func (d *DockerClient) ListImages() ([]ImageInfo, error) {
-	images, err := d.cli.ImageList(context.Background(), image.ListOptions{All: true})
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+
+	images, err := d.cli.ImageList(ctx, image.ListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
@@ -306,10 +292,10 @@ func (d *DockerClient) ListImages() ([]ImageInfo, error) {
 		}
 
 		size := fmt.Sprintf("%.2f MB", float64(img.Size)/(1024*1024))
-		created := fmt.Sprintf("%d days ago", img.Created/86400)
+		created := formatRelativeDuration(time.Since(time.Unix(img.Created, 0)))
 
 		info := ImageInfo{
-			ID:      img.ID[7:19], // Short ID
+			ID:      shortImageID(img.ID),
 			Tag:     tag,
 			Size:    size,
 			Created: created,
@@ -321,15 +307,22 @@ func (d *DockerClient) ListImages() ([]ImageInfo, error) {
 }
 
 func (d *DockerClient) ListNetworks() ([]NetworkInfo, error) {
-	networks, err := d.cli.NetworkList(context.Background(), network.ListOptions{})
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+
+	networks, err := d.cli.NetworkList(ctx, network.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	var result []NetworkInfo
 	for _, net := range networks {
+		id := net.ID
+		if len(id) > 12 {
+			id = id[:12]
+		}
 		info := NetworkInfo{
-			ID:     net.ID[:12],
+			ID:     id,
 			Name:   net.Name,
 			Driver: net.Driver,
 			Scope:  net.Scope,
@@ -341,7 +334,10 @@ func (d *DockerClient) ListNetworks() ([]NetworkInfo, error) {
 }
 
 func (d *DockerClient) ListVolumes() ([]VolumeInfo, error) {
-	volumes, err := d.cli.VolumeList(context.Background(), volume.ListOptions{})
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+
+	volumes, err := d.cli.VolumeList(ctx, volume.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -360,14 +356,65 @@ func (d *DockerClient) ListVolumes() ([]VolumeInfo, error) {
 }
 
 func (d *DockerClient) RemoveImage(id string) error {
-	_, err := d.cli.ImageRemove(context.Background(), id, image.RemoveOptions{})
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+	_, err := d.cli.ImageRemove(ctx, id, image.RemoveOptions{})
 	return err
 }
 
 func (d *DockerClient) RemoveNetwork(id string) error {
-	return d.cli.NetworkRemove(context.Background(), id)
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+	return d.cli.NetworkRemove(ctx, id)
 }
 
 func (d *DockerClient) RemoveVolume(name string) error {
-	return d.cli.VolumeRemove(context.Background(), name, false)
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+	return d.cli.VolumeRemove(ctx, name, false)
+}
+
+func shortImageID(id string) string {
+	const prefix = "sha256:"
+	if strings.HasPrefix(id, prefix) {
+		trimmed := id[len(prefix):]
+		if len(trimmed) >= 12 {
+			return trimmed[:12]
+		}
+		return trimmed
+	}
+	if len(id) >= 12 {
+		return id[:12]
+	}
+	return id
+}
+
+func formatRelativeDuration(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	if d < time.Minute {
+		return "just now"
+	}
+
+	units := []struct {
+		dur   time.Duration
+		label string
+	}{
+		{time.Hour * 24 * 365, "y"},
+		{time.Hour * 24 * 30, "mo"},
+		{time.Hour * 24 * 7, "w"},
+		{time.Hour * 24, "d"},
+		{time.Hour, "h"},
+		{time.Minute, "m"},
+	}
+
+	for _, unit := range units {
+		if d >= unit.dur {
+			value := d / unit.dur
+			return fmt.Sprintf("%d%s ago", value, unit.label)
+		}
+	}
+
+	return "just now"
 }

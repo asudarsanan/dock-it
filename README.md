@@ -186,3 +186,9 @@ Contributions welcome! Please:
 ---
 
 Built with ❤️ using Go and tview
+
+## CI/CD
+
+This repository ships with a GitHub Actions workflow that:
+- runs gofmt, `go vet`, `go test` on Linux and macOS for every push/PR targeting `main`
+- builds release binaries for Linux (amd64/arm64) and macOS (amd64/arm64) whenever a `v*` tag is pushed, publishing them as release assets with accompanying SHA-256 checksums
