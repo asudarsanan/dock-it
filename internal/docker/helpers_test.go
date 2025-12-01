@@ -1,4 +1,4 @@
-package main
+package docker
 
 import (
 	"testing"
@@ -100,6 +100,34 @@ func TestTimeoutCtx(t *testing.T) {
 		}
 		if remaining < defaultTimeout-50*time.Millisecond || remaining > defaultTimeout+50*time.Millisecond {
 			t.Fatalf("default deadline outside tolerance: got %s", remaining)
+		}
+	})
+}
+
+func TestFormatAsJSON(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		input := struct {
+			A string
+			B int
+		}{A: "foo", B: 42}
+		got, err := formatAsJSON(input)
+		if err != nil {
+			t.Fatalf("formatAsJSON() unexpected error: %v", err)
+		}
+		want := "{\n  \"A\": \"foo\",\n  \"B\": 42\n}"
+		if got != want {
+			t.Fatalf("formatAsJSON() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("error", func(t *testing.T) {
+		t.Parallel()
+		_, err := formatAsJSON(make(chan int))
+		if err == nil {
+			t.Fatalf("expected error for unsupported type")
 		}
 	})
 }

@@ -1,6 +1,4 @@
-// Package main provides a terminal-based Docker management interface.
-// This file contains the Docker client wrapper and API interaction logic.
-package main
+package docker
 
 import (
 	"context"
@@ -24,12 +22,12 @@ const (
 	maxStatsWorkers = 4
 )
 
-// DockerClient wraps the Docker SDK client with high-level methods
-type DockerClient struct {
+// Client wraps the Docker SDK client with high-level helpers consumed by the UI layer.
+type Client struct {
 	cli *client.Client
 }
 
-// ContainerInfo holds display information for a single container
+// ContainerInfo holds display information for a single container.
 type ContainerInfo struct {
 	ID     string
 	Name   string
@@ -42,7 +40,7 @@ type ContainerInfo struct {
 	NetIO  string
 }
 
-// ImageInfo holds display information for a Docker image
+// ImageInfo holds display information for a Docker image.
 type ImageInfo struct {
 	ID      string
 	Tag     string
@@ -50,7 +48,7 @@ type ImageInfo struct {
 	Created string
 }
 
-// NetworkInfo holds display information for a Docker network
+// NetworkInfo holds display information for a Docker network.
 type NetworkInfo struct {
 	ID     string
 	Name   string
@@ -58,27 +56,27 @@ type NetworkInfo struct {
 	Scope  string
 }
 
-// VolumeInfo holds display information for a Docker volume
+// VolumeInfo holds display information for a Docker volume.
 type VolumeInfo struct {
 	Name       string
 	Driver     string
 	Mountpoint string
 }
 
-// ContainerStats holds formatted resource usage statistics
+// ContainerStats holds formatted resource usage statistics.
 type ContainerStats struct {
 	CPU    string
 	Memory string
 	NetIO  string
 }
 
-// NewDockerClient creates a new Docker client using environment variables
-func NewDockerClient() (*DockerClient, error) {
+// NewClient creates a new Docker client using environment variables.
+func NewClient() (*Client, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, err
 	}
-	return &DockerClient{cli: cli}, nil
+	return &Client{cli: cli}, nil
 }
 
 func timeoutCtx(timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -88,11 +86,12 @@ func timeoutCtx(timeout time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), timeout)
 }
 
-func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
+// ListContainers retrieves all containers and augments running ones with stats.
+func (c *Client) ListContainers() ([]ContainerInfo, error) {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
 
-	containers, err := d.cli.ContainerList(ctx, container.ListOptions{All: true})
+	containers, err := c.cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
@@ -100,16 +99,16 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 	var result []ContainerInfo
 	runningContainers := make(map[string]int)
 
-	for i, c := range containers {
+	for i, ctr := range containers {
 		name := "<none>"
-		if len(c.Names) > 0 {
-			name = strings.TrimPrefix(c.Names[0], "/")
+		if len(ctr.Names) > 0 {
+			name = strings.TrimPrefix(ctr.Names[0], "/")
 		}
 
 		ports := "-"
-		if len(c.Ports) > 0 {
-			portList := make([]string, 0, len(c.Ports))
-			for _, port := range c.Ports {
+		if len(ctr.Ports) > 0 {
+			portList := make([]string, 0, len(ctr.Ports))
+			for _, port := range ctr.Ports {
 				if port.PublicPort > 0 {
 					portList = append(portList, fmt.Sprintf("%d->%d", port.PublicPort, port.PrivatePort))
 				}
@@ -120,11 +119,11 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 		}
 
 		info := ContainerInfo{
-			ID:     c.ID,
+			ID:     ctr.ID,
 			Name:   name,
-			Image:  c.Image,
-			Status: c.Status,
-			State:  c.State,
+			Image:  ctr.Image,
+			Status: ctr.Status,
+			State:  ctr.State,
 			Ports:  ports,
 			CPU:    "-",
 			Memory: "-",
@@ -132,8 +131,8 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 		}
 		result = append(result, info)
 
-		if c.State == "running" {
-			runningContainers[c.ID] = i
+		if ctr.State == "running" {
+			runningContainers[ctr.ID] = i
 		}
 	}
 
@@ -152,7 +151,7 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 				statsCtx, cancelStats := timeoutCtx(statsTimeout)
 				defer cancelStats()
 
-				stats, err := d.getContainerStatsWithContext(statsCtx, containerID)
+				stats, err := c.getContainerStatsWithContext(statsCtx, containerID)
 				if err == nil {
 					mu.Lock()
 					result[index].CPU = stats.CPU
@@ -169,15 +168,13 @@ func (d *DockerClient) ListContainers() ([]ContainerInfo, error) {
 	return result, nil
 }
 
-// getContainerStats fetches container stats with a default background context
-func (d *DockerClient) getContainerStats(id string) (*ContainerStats, error) {
+func (c *Client) getContainerStats(id string) (*ContainerStats, error) {
 	ctx := context.Background()
-	return d.getContainerStatsWithContext(ctx, id)
+	return c.getContainerStatsWithContext(ctx, id)
 }
 
-// getContainerStatsWithContext fetches container stats with a provided context for timeout/cancellation
-func (d *DockerClient) getContainerStatsWithContext(ctx context.Context, id string) (*ContainerStats, error) {
-	statsResp, err := d.cli.ContainerStats(ctx, id, false)
+func (c *Client) getContainerStatsWithContext(ctx context.Context, id string) (*ContainerStats, error) {
+	statsResp, err := c.cli.ContainerStats(ctx, id, false)
 	if err != nil {
 		return nil, err
 	}
@@ -221,33 +218,33 @@ func (d *DockerClient) getContainerStatsWithContext(ctx context.Context, id stri
 	}, nil
 }
 
-func (d *DockerClient) StartContainer(id string) error {
+func (c *Client) StartContainer(id string) error {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
-	return d.cli.ContainerStart(ctx, id, container.StartOptions{})
+	return c.cli.ContainerStart(ctx, id, container.StartOptions{})
 }
 
-func (d *DockerClient) StopContainer(id string) error {
-	ctx, cancel := timeoutCtx(defaultTimeout)
-	defer cancel()
-	timeout := 10
-	return d.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
-}
-
-func (d *DockerClient) RestartContainer(id string) error {
+func (c *Client) StopContainer(id string) error {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
 	timeout := 10
-	return d.cli.ContainerRestart(ctx, id, container.StopOptions{Timeout: &timeout})
+	return c.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
 }
 
-func (d *DockerClient) RemoveContainer(id string) error {
+func (c *Client) RestartContainer(id string) error {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
-	return d.cli.ContainerRemove(ctx, id, container.RemoveOptions{})
+	timeout := 10
+	return c.cli.ContainerRestart(ctx, id, container.StopOptions{Timeout: &timeout})
 }
 
-func (d *DockerClient) GetContainerLogs(id string, tail string) (string, error) {
+func (c *Client) RemoveContainer(id string) error {
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+	return c.cli.ContainerRemove(ctx, id, container.RemoveOptions{})
+}
+
+func (c *Client) GetContainerLogs(id string, tail string) (string, error) {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
 	options := container.LogsOptions{
@@ -257,7 +254,7 @@ func (d *DockerClient) GetContainerLogs(id string, tail string) (string, error) 
 		Timestamps: false,
 	}
 
-	out, err := d.cli.ContainerLogs(ctx, id, options)
+	out, err := c.cli.ContainerLogs(ctx, id, options)
 	if err != nil {
 		return "", err
 	}
@@ -271,15 +268,15 @@ func (d *DockerClient) GetContainerLogs(id string, tail string) (string, error) 
 	return string(data), nil
 }
 
-func (d *DockerClient) ExecContainer(id string) error {
+func (c *Client) ExecContainer(id string) error {
 	return nil // Placeholder - will be implemented with actual shell execution
 }
 
-func (d *DockerClient) ListImages() ([]ImageInfo, error) {
+func (c *Client) ListImages() ([]ImageInfo, error) {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
 
-	images, err := d.cli.ImageList(ctx, image.ListOptions{All: true})
+	images, err := c.cli.ImageList(ctx, image.ListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
@@ -306,11 +303,11 @@ func (d *DockerClient) ListImages() ([]ImageInfo, error) {
 	return result, nil
 }
 
-func (d *DockerClient) ListNetworks() ([]NetworkInfo, error) {
+func (c *Client) ListNetworks() ([]NetworkInfo, error) {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
 
-	networks, err := d.cli.NetworkList(ctx, network.ListOptions{})
+	networks, err := c.cli.NetworkList(ctx, network.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -333,11 +330,11 @@ func (d *DockerClient) ListNetworks() ([]NetworkInfo, error) {
 	return result, nil
 }
 
-func (d *DockerClient) ListVolumes() ([]VolumeInfo, error) {
+func (c *Client) ListVolumes() ([]VolumeInfo, error) {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
 
-	volumes, err := d.cli.VolumeList(ctx, volume.ListOptions{})
+	volumes, err := c.cli.VolumeList(ctx, volume.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -355,23 +352,75 @@ func (d *DockerClient) ListVolumes() ([]VolumeInfo, error) {
 	return result, nil
 }
 
-func (d *DockerClient) RemoveImage(id string) error {
+func (c *Client) RemoveImage(id string) error {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
-	_, err := d.cli.ImageRemove(ctx, id, image.RemoveOptions{})
+	_, err := c.cli.ImageRemove(ctx, id, image.RemoveOptions{})
 	return err
 }
 
-func (d *DockerClient) RemoveNetwork(id string) error {
+func (c *Client) RemoveNetwork(id string) error {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
-	return d.cli.NetworkRemove(ctx, id)
+	return c.cli.NetworkRemove(ctx, id)
 }
 
-func (d *DockerClient) RemoveVolume(name string) error {
+func (c *Client) RemoveVolume(name string) error {
 	ctx, cancel := timeoutCtx(defaultTimeout)
 	defer cancel()
-	return d.cli.VolumeRemove(ctx, name, false)
+	return c.cli.VolumeRemove(ctx, name, false)
+}
+
+func (c *Client) DescribeContainer(id string) (string, error) {
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+
+	data, err := c.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return formatAsJSON(data)
+}
+
+func (c *Client) DescribeImage(id string) (string, error) {
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+
+	data, _, err := c.cli.ImageInspectWithRaw(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return formatAsJSON(data)
+}
+
+func (c *Client) DescribeNetwork(id string) (string, error) {
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+
+	data, err := c.cli.NetworkInspect(ctx, id, network.InspectOptions{})
+	if err != nil {
+		return "", err
+	}
+	return formatAsJSON(data)
+}
+
+func (c *Client) DescribeVolume(name string) (string, error) {
+	ctx, cancel := timeoutCtx(defaultTimeout)
+	defer cancel()
+
+	data, err := c.cli.VolumeInspect(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	return formatAsJSON(data)
+}
+
+func formatAsJSON(v interface{}) (string, error) {
+	buf, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(buf), nil
 }
 
 func shortImageID(id string) string {

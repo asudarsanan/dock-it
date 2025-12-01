@@ -12,7 +12,8 @@ A fast, terminal-based Docker management tool inspired by k9s, built with Go.
 
 ### Container Operations
 - 📊 **Real-time Metrics**: CPU, Memory, and Network I/O stats
-- 📝 **Log Streaming**: View container logs with scrolling
+- 📝 **Log Streaming**: View color-coded container logs with scrolling
+- 🔍 **Describe Resources**: Inspect containers, images, networks, and volumes via prettified JSON detail views
 - 🖥️ **Shell Access**: Execute interactive shells into containers
 - ⚡ **Quick Actions**: Start, stop, restart, delete with single keystrokes
 - 🎨 **Status Indicators**: Color-coded container states (running=green, exited=red)
@@ -32,13 +33,21 @@ A fast, terminal-based Docker management tool inspired by k9s, built with Go.
 ```bash
 git clone <your-repo-url>
 cd dock-it
-go build -o dock-it
+go build -o dock-it ./cmd/dock-it
 ./dock-it
+```
+
+Or use the provided Makefile helpers:
+
+```bash
+make build   # builds ./cmd/dock-it into ./bin/dock-it
+make test    # runs go test ./...
+make clean   # removes bin/, dock-it, dist/ and module cache
 ```
 
 ### Quick Run (Development)
 ```bash
-go run main.go
+go run ./cmd/dock-it
 ```
 
 ## Usage
@@ -56,18 +65,22 @@ go run main.go
 - `x` - Stop selected container
 - `r` - Restart selected container
 - `d` - Delete selected container
+- `i` - Describe selected container
 - `l` - View container logs
 - `e` - Execute shell in container (interactive)
 - `R` - Refresh current view
 
 #### Image Actions
 - `d` - Delete selected image
+- `i` - Describe selected image
 
 #### Network Actions
 - `d` - Delete selected network
+- `i` - Describe selected network
 
 #### Volume Actions
 - `d` - Delete selected volume
+- `i` - Describe selected volume
 
 #### General
 - `q` - Quit application
@@ -89,30 +102,34 @@ Metrics use a 2-second timeout to ensure UI responsiveness.
 ### Project Structure
 ```
 dock-it/
-├── main.go       # Application entry point
-├── docker.go     # Docker API client wrapper
-├── ui.go         # TUI implementation with tview
-├── go.mod        # Go module dependencies
-└── README.md     # Documentation
+├── cmd/dock-it/main.go   # Application entry point
+├── internal/app/         # Wiring + orchestration
+├── internal/docker/      # Docker SDK wrapper + helpers
+├── internal/logs/        # Log colorization utilities
+├── internal/ui/          # tview-powered terminal UI
+├── go.mod                # Go module definition
+└── README.md             # Documentation
 ```
+
+See the `docs/` directory for deep dives (`docs/architecture.md`) and scratch notes (`docs/notes.md`).
 
 ### Key Components
 
-#### `docker.go` - Docker Client
+#### `internal/docker` - Docker Client
 - Wraps Docker SDK for Go
 - Provides high-level methods for all resource types
 - Context-aware stats fetching with timeout protection
 - Error handling and data parsing
 
-#### `ui.go` - Terminal UI
+#### `internal/ui` - Terminal UI
 - Built with [tview](https://github.com/rivo/tview)
 - Table-based views with full-width columns
 - Async operations using goroutines + QueueUpdateDraw
 - Modal logs view with scrolling
 
-#### `main.go` - Orchestration
-- Initializes Docker client and UI
-- Minimal coordination layer
+#### `internal/app` + `cmd/dock-it`
+- Initializes shared services and launches the UI
+- Keeps the entrypoint slim for future CLIs or tooling
 
 ### Async Design Pattern
 

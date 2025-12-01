@@ -1,52 +1,54 @@
-// Package main provides a terminal-based Docker management interface.
-// This file contains the TUI implementation using tview.
-package main
+package ui
 
 import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"dock-it/internal/docker"
+	"dock-it/internal/logs"
 )
 
-// UI manages the terminal user interface state and components
+// UI manages the terminal interface and orchestrates Docker operations.
 type UI struct {
 	app         *tview.Application
 	table       *tview.Table
 	statusBar   *tview.TextView
-	logsView    *tview.TextView
+	detailView  *tview.TextView
 	mainView    *tview.Flex
-	docker      *DockerClient
-	containers  []ContainerInfo
-	images      []ImageInfo
-	networks    []NetworkInfo
-	volumes     []VolumeInfo
-	viewMode    string // "containers", "images", "networks", "volumes", "logs"
-	currentView string // Track current resource view
+	docker      *docker.Client
+	containers  []docker.ContainerInfo
+	images      []docker.ImageInfo
+	networks    []docker.NetworkInfo
+	volumes     []docker.VolumeInfo
+	viewMode    string
+	currentView string
 }
 
 const (
-	tableStatusText = "[yellow]1[white]:containers [yellow]2[white]:images [yellow]3[white]:networks [yellow]4[white]:volumes | [yellow]s[white]:start [yellow]x[white]:stop [yellow]d[white]:delete [yellow]q[white]:quit"
-	logsStatusText  = "[yellow]ESC/q[white]:back [yellow]↑↓[white]:scroll"
-	containersTitle = " Docker Containers (dock-it) "
-	imagesTitle     = " Docker Images "
-	networksTitle   = " Docker Networks "
-	volumesTitle    = " Docker Volumes "
+	tableStatusText  = "[yellow]1[white]:containers [yellow]2[white]:images [yellow]3[white]:networks [yellow]4[white]:volumes | [yellow]s[white]:start [yellow]x[white]:stop [yellow]d[white]:delete [yellow]i[white]:describe [yellow]q[white]:quit"
+	detailStatusText = "[yellow]ESC/q[white]:back [yellow]↑↓[white]:scroll"
+	containersTitle  = " Docker Containers (dock-it) "
+	imagesTitle      = " Docker Images "
+	networksTitle    = " Docker Networks "
+	volumesTitle     = " Docker Volumes "
 )
 
-// NewUI creates a new UI instance with the provided Docker client
-func NewUI(docker *DockerClient) *UI {
+// New constructs a UI bound to the provided Docker client.
+func New(dockerClient *docker.Client) *UI {
 	return &UI{
 		app:         tview.NewApplication(),
-		docker:      docker,
-		viewMode:    "containers",
+		docker:      dockerClient,
+		viewMode:    "list",
 		currentView: "containers",
 	}
 }
 
-// Initialize sets up the UI components and loads initial data
+// Initialize configures primitive components and loads initial data.
 func (u *UI) Initialize() {
 	u.table = tview.NewTable().
 		SetBorders(false).
@@ -54,13 +56,13 @@ func (u *UI) Initialize() {
 		SetFixed(1, 0)
 	u.table.SetTitle(containersTitle).SetBorder(true)
 
-	u.logsView = tview.NewTextView().
+	u.detailView = tview.NewTextView().
 		SetDynamicColors(true).
 		SetScrollable(true).
 		SetChangedFunc(func() {
 			u.app.Draw()
 		})
-	u.logsView.SetTitle(" Container Logs ").SetBorder(true)
+	u.detailView.SetTitle(" Details ").SetBorder(true)
 
 	u.statusBar = tview.NewTextView().
 		SetDynamicColors(true)
@@ -145,6 +147,9 @@ func (u *UI) setupKeyBindings() {
 			case 'l':
 				u.showLogs(selectedContainer)
 				return nil
+			case 'i':
+				u.describeContainer(selectedContainer)
+				return nil
 			case 'e':
 				if selectedContainer.State == "running" {
 					u.execContainer(selectedContainer)
@@ -168,6 +173,9 @@ func (u *UI) setupKeyBindings() {
 					u.loadImages()
 				})
 				return nil
+			case 'i':
+				u.describeImage(selectedImage)
+				return nil
 			}
 		case "networks":
 			row, _ := u.table.GetSelection()
@@ -185,6 +193,9 @@ func (u *UI) setupKeyBindings() {
 				}, func() {
 					u.loadNetworks()
 				})
+				return nil
+			case 'i':
+				u.describeNetwork(selectedNetwork)
 				return nil
 			}
 		case "volumes":
@@ -204,13 +215,16 @@ func (u *UI) setupKeyBindings() {
 					u.loadVolumes()
 				})
 				return nil
+			case 'i':
+				u.describeVolume(selectedVolume)
+				return nil
 			}
 		}
 
 		return event
 	})
 
-	u.logsView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	u.detailView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEscape:
 			u.switchToTableView()
@@ -228,8 +242,8 @@ func (u *UI) setStatusMessage(msg string) {
 }
 
 func (u *UI) updateStatusBarText() {
-	if u.viewMode == "logs" {
-		u.statusBar.SetText(logsStatusText)
+	if u.viewMode == "detail" {
+		u.statusBar.SetText(detailStatusText)
 		return
 	}
 	u.statusBar.SetText(tableStatusText)
@@ -273,34 +287,81 @@ func (u *UI) reloadCurrentView() {
 	}
 }
 
-func (u *UI) showLogs(container ContainerInfo) {
-	u.logsView.Clear()
-	u.logsView.SetTitle(fmt.Sprintf(" Logs: %s ", container.Name))
-	u.logsView.SetText("Loading logs...")
+func (u *UI) showDetail(title string, loader func() (string, error)) {
+	u.detailView.Clear()
+	u.detailView.SetTitle(title)
+	u.detailView.SetText("Loading...")
 
 	go func() {
-		logs, err := u.docker.GetContainerLogs(container.ID, "100")
+		content, err := loader()
 		u.app.QueueUpdateDraw(func() {
 			if err != nil {
-				u.logsView.SetText(fmt.Sprintf("[red]Error fetching logs: %v", err))
+				u.detailView.SetText(fmt.Sprintf("[red]Error: %v", err))
 				return
 			}
-			u.logsView.SetText(logs)
+			if strings.TrimSpace(content) == "" {
+				u.detailView.SetText("(no data)")
+				return
+			}
+			u.detailView.SetText(content)
 		})
 	}()
 
-	u.viewMode = "logs"
+	u.viewMode = "detail"
 	u.updateStatusBarText()
 
 	u.mainView.Clear()
-	u.mainView.AddItem(u.logsView, 0, 1, true)
+	u.mainView.AddItem(u.detailView, 0, 1, true)
 	u.mainView.AddItem(u.statusBar, 1, 0, false)
 
-	u.app.SetFocus(u.logsView)
+	u.app.SetFocus(u.detailView)
+}
+
+func (u *UI) showLogs(container docker.ContainerInfo) {
+	title := fmt.Sprintf(" Logs: %s ", container.Name)
+	u.showDetail(title, func() (string, error) {
+		logsOutput, err := u.docker.GetContainerLogs(container.ID, "100")
+		if err != nil {
+			return "", err
+		}
+		return logs.Colorize(logsOutput), nil
+	})
+}
+
+func (u *UI) describeContainer(container docker.ContainerInfo) {
+	title := fmt.Sprintf(" Describe Container: %s ", container.Name)
+	u.showDetail(title, func() (string, error) {
+		return u.docker.DescribeContainer(container.ID)
+	})
+}
+
+func (u *UI) describeImage(image docker.ImageInfo) {
+	label := image.Tag
+	if label == "<none>" {
+		label = image.ID
+	}
+	title := fmt.Sprintf(" Describe Image: %s ", label)
+	u.showDetail(title, func() (string, error) {
+		return u.docker.DescribeImage(image.ID)
+	})
+}
+
+func (u *UI) describeNetwork(network docker.NetworkInfo) {
+	title := fmt.Sprintf(" Describe Network: %s ", network.Name)
+	u.showDetail(title, func() (string, error) {
+		return u.docker.DescribeNetwork(network.ID)
+	})
+}
+
+func (u *UI) describeVolume(volume docker.VolumeInfo) {
+	title := fmt.Sprintf(" Describe Volume: %s ", volume.Name)
+	u.showDetail(title, func() (string, error) {
+		return u.docker.DescribeVolume(volume.Name)
+	})
 }
 
 func (u *UI) switchToTableView() {
-	u.viewMode = "containers"
+	u.viewMode = "list"
 	u.updateStatusBarText()
 
 	u.mainView.Clear()
@@ -311,15 +372,13 @@ func (u *UI) switchToTableView() {
 	u.reloadCurrentView()
 }
 
-func (u *UI) execContainer(container ContainerInfo) {
+func (u *UI) execContainer(container docker.ContainerInfo) {
 	u.app.Suspend(func() {
-		// Use docker exec to open an interactive shell
 		cmd := fmt.Sprintf("docker exec -it %s /bin/sh || docker exec -it %s /bin/bash", container.ID[:12], container.ID[:12])
-		fmt.Printf("\033[2J\033[H") // Clear screen
+		fmt.Printf("\033[2J\033[H")
 		fmt.Printf("Opening shell in container: %s\n", container.Name)
 		fmt.Printf("Type 'exit' to return to dock-it\n\n")
 
-		// Execute the command in the current terminal
 		shellCmd := exec.Command("sh", "-c", cmd)
 		shellCmd.Stdin = os.Stdin
 		shellCmd.Stdout = os.Stdout
@@ -372,7 +431,7 @@ func (u *UI) loadVolumes() {
 	}(currentRow)
 }
 
-func (u *UI) renderContainers(containers []ContainerInfo, err error, selectedRow int) {
+func (u *UI) renderContainers(containers []docker.ContainerInfo, err error, selectedRow int) {
 	u.table.Clear()
 	u.table.SetTitle(containersTitle)
 	if err != nil {
@@ -429,7 +488,7 @@ func (u *UI) renderContainers(containers []ContainerInfo, err error, selectedRow
 	u.restoreSelection(selectedRow, len(containers))
 }
 
-func (u *UI) renderImages(images []ImageInfo, err error, selectedRow int) {
+func (u *UI) renderImages(images []docker.ImageInfo, err error, selectedRow int) {
 	u.table.Clear()
 	u.table.SetTitle(imagesTitle)
 	if err != nil {
@@ -468,7 +527,7 @@ func (u *UI) renderImages(images []ImageInfo, err error, selectedRow int) {
 	u.restoreSelection(selectedRow, len(images))
 }
 
-func (u *UI) renderNetworks(networks []NetworkInfo, err error, selectedRow int) {
+func (u *UI) renderNetworks(networks []docker.NetworkInfo, err error, selectedRow int) {
 	u.table.Clear()
 	u.table.SetTitle(networksTitle)
 	if err != nil {
@@ -507,7 +566,7 @@ func (u *UI) renderNetworks(networks []NetworkInfo, err error, selectedRow int) 
 	u.restoreSelection(selectedRow, len(networks))
 }
 
-func (u *UI) renderVolumes(volumes []VolumeInfo, err error, selectedRow int) {
+func (u *UI) renderVolumes(volumes []docker.VolumeInfo, err error, selectedRow int) {
 	u.table.Clear()
 	u.table.SetTitle(volumesTitle)
 	if err != nil {
@@ -554,6 +613,7 @@ func (u *UI) restoreSelection(selectedRow, total int) {
 	}
 }
 
+// Run bootstraps the flex layout and starts the tview event loop.
 func (u *UI) Run() error {
 	u.mainView = tview.NewFlex().
 		SetDirection(tview.FlexRow).
