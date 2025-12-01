@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -50,6 +52,13 @@ func New(dockerClient *docker.Client) *UI {
 
 // Initialize configures primitive components and loads initial data.
 func (u *UI) Initialize() {
+	tview.Styles.PrimitiveBackgroundColor = tcell.ColorBlack
+	tview.Styles.ContrastBackgroundColor = tcell.ColorBlack
+	tview.Styles.MoreContrastBackgroundColor = tcell.ColorBlack
+	tview.Styles.BorderColor = tcell.ColorGray
+	tview.Styles.TitleColor = tcell.ColorWhite
+	tview.Styles.GraphicsColor = tcell.ColorGray
+
 	u.table = tview.NewTable().
 		SetBorders(false).
 		SetSelectable(true, false).
@@ -374,17 +383,70 @@ func (u *UI) switchToTableView() {
 
 func (u *UI) execContainer(container docker.ContainerInfo) {
 	u.app.Suspend(func() {
-		cmd := fmt.Sprintf("docker exec -it %s /bin/sh || docker exec -it %s /bin/bash", container.ID[:12], container.ID[:12])
+		id := container.ID
+		shortID := id
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+
 		fmt.Printf("\033[2J\033[H")
-		fmt.Printf("Opening shell in container: %s\n", container.Name)
+		fmt.Printf("Opening shell in container: %s (%s)\n", container.Name, shortID)
 		fmt.Printf("Type 'exit' to return to dock-it\n\n")
 
-		shellCmd := exec.Command("sh", "-c", cmd)
-		shellCmd.Stdin = os.Stdin
-		shellCmd.Stdout = os.Stdout
-		shellCmd.Stderr = os.Stderr
-		shellCmd.Run()
+		shells := preferredShells()
+		var lastErr error
+		for i, shell := range shells {
+			if err := runDockerExec(id, shell); err == nil {
+				return
+			} else {
+				lastErr = err
+				if i < len(shells)-1 {
+					fmt.Printf("Failed to start %s: %v\nTrying fallback shell...\n", shell, err)
+				}
+			}
+		}
+
+		fmt.Printf("Failed to exec into container after trying %d shell(s): %v\n", len(shells), lastErr)
+		fmt.Print("Press Enter to continue...")
+		bufio.NewReader(os.Stdin).ReadString('\n')
 	})
+}
+
+func runDockerExec(containerID, shell string) error {
+	cmd := exec.Command("docker", "exec", "-it", containerID, shell)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func preferredShells() []string {
+	seen := make(map[string]struct{})
+	appendUnique := func(list []string, values ...string) []string {
+		for _, v := range values {
+			if v == "" {
+				continue
+			}
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+			list = append(list, v)
+		}
+		return list
+	}
+
+	var shells []string
+	if shell := os.Getenv("SHELL"); shell != "" {
+		shells = appendUnique(shells, shell)
+		base := filepath.Base(shell)
+		if base != shell {
+			shells = appendUnique(shells, base)
+		}
+	}
+
+	shells = appendUnique(shells, "bash", "sh")
+	return shells
 }
 
 func (u *UI) loadContainers() {
@@ -445,7 +507,7 @@ func (u *UI) renderContainers(containers []docker.ContainerInfo, err error, sele
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
 			SetTextColor(tcell.ColorYellow).
-			SetAlign(tview.AlignLeft).
+			SetAlign(tview.AlignCenter).
 			SetSelectable(false).
 			SetExpansion(1).
 			SetAttributes(tcell.AttrBold))
@@ -502,7 +564,7 @@ func (u *UI) renderImages(images []docker.ImageInfo, err error, selectedRow int)
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
 			SetTextColor(tcell.ColorYellow).
-			SetAlign(tview.AlignLeft).
+			SetAlign(tview.AlignCenter).
 			SetSelectable(false).
 			SetExpansion(1).
 			SetAttributes(tcell.AttrBold))
@@ -541,7 +603,7 @@ func (u *UI) renderNetworks(networks []docker.NetworkInfo, err error, selectedRo
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
 			SetTextColor(tcell.ColorYellow).
-			SetAlign(tview.AlignLeft).
+			SetAlign(tview.AlignCenter).
 			SetSelectable(false).
 			SetExpansion(1).
 			SetAttributes(tcell.AttrBold))
@@ -580,7 +642,7 @@ func (u *UI) renderVolumes(volumes []docker.VolumeInfo, err error, selectedRow i
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
 			SetTextColor(tcell.ColorYellow).
-			SetAlign(tview.AlignLeft).
+			SetAlign(tview.AlignCenter).
 			SetSelectable(false).
 			SetExpansion(1).
 			SetAttributes(tcell.AttrBold))
