@@ -12,6 +12,7 @@ import (
 	"github.com/rivo/tview"
 
 	"dock-it/internal/docker"
+	"dock-it/internal/filter"
 	"dock-it/internal/logs"
 )
 
@@ -21,6 +22,7 @@ type UI struct {
 	table       *tview.Table
 	statusBar   *tview.TextView
 	detailView  *tview.TextView
+	filterInput *tview.InputField
 	mainView    *tview.Flex
 	docker      *docker.Client
 	containers  []docker.ContainerInfo
@@ -29,11 +31,14 @@ type UI struct {
 	volumes     []docker.VolumeInfo
 	viewMode    string
 	currentView string
+	filter      *filter.Filter
+	filterMode  bool
 }
 
 const (
-	tableStatusText  = "[yellow]1[white]:containers [yellow]2[white]:images [yellow]3[white]:networks [yellow]4[white]:volumes | [yellow]s[white]:start [yellow]x[white]:stop [yellow]d[white]:delete [yellow]i[white]:describe [yellow]q[white]:quit"
+	tableStatusText  = "[yellow]1[white]:containers [yellow]2[white]:images [yellow]3[white]:networks [yellow]4[white]:volumes | [yellow]/[white]:search [yellow]c[white]:clear [yellow]s[white]:start [yellow]x[white]:stop [yellow]d[white]:delete [yellow]i[white]:describe [yellow]q[white]:quit"
 	detailStatusText = "[yellow]ESC/q[white]:back [yellow]↑↓[white]:scroll"
+	filterStatusText = "[yellow]Enter[white]:search [yellow]ESC[white]:cancel [yellow]Ctrl+U[white]:clear | Search across name, image, status, etc. or use advanced: [gray]age>1h, status=running[white]"
 	containersTitle  = " Docker Containers (dock-it) "
 	imagesTitle      = " Docker Images "
 	networksTitle    = " Docker Networks "
@@ -47,6 +52,8 @@ func New(dockerClient *docker.Client) *UI {
 		docker:      dockerClient,
 		viewMode:    "list",
 		currentView: "containers",
+		filter:      filter.New(),
+		filterMode:  false,
 	}
 }
 
@@ -72,6 +79,13 @@ func (u *UI) Initialize() {
 			u.app.Draw()
 		})
 	u.detailView.SetTitle(" Details ").SetBorder(true)
+
+	u.filterInput = tview.NewInputField().
+		SetLabel("Search: ").
+		SetFieldWidth(0).
+		SetFieldBackgroundColor(tcell.ColorBlack).
+		SetPlaceholder("Type to search across all fields (or use advanced filters like age>1h)")
+	u.filterInput.SetBorder(true).SetTitle(" Search/Filter ")
 
 	u.statusBar = tview.NewTextView().
 		SetDynamicColors(true)
@@ -99,6 +113,14 @@ func (u *UI) setupKeyBindings() {
 		case '4':
 			u.currentView = "volumes"
 			u.loadVolumes()
+			return nil
+		case '/':
+			u.showFilterInput()
+			return nil
+		case 'c':
+			if !u.filter.IsEmpty() {
+				u.clearFilter()
+			}
 			return nil
 		case 'R':
 			u.reloadCurrentView()
@@ -244,6 +266,21 @@ func (u *UI) setupKeyBindings() {
 		}
 		return event
 	})
+
+	u.filterInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			u.applyFilter()
+			return nil
+		case tcell.KeyEscape:
+			u.hideFilterInput()
+			return nil
+		case tcell.KeyCtrlU:
+			u.filterInput.SetText("")
+			return nil
+		}
+		return event
+	})
 }
 
 func (u *UI) setStatusMessage(msg string) {
@@ -255,7 +292,16 @@ func (u *UI) updateStatusBarText() {
 		u.statusBar.SetText(detailStatusText)
 		return
 	}
-	u.statusBar.SetText(tableStatusText)
+	if u.filterMode {
+		u.statusBar.SetText(filterStatusText)
+		return
+	}
+
+	statusText := tableStatusText
+	if !u.filter.IsEmpty() {
+		statusText = fmt.Sprintf("[green]Filter: %s[white] | [yellow]c[white]:clear | %s", u.filter.String(), tableStatusText)
+	}
+	u.statusBar.SetText(statusText)
 }
 
 func (u *UI) runAsyncAction(actionLabel string, action func() error, onSuccess func()) {
@@ -281,6 +327,55 @@ func (u *UI) showLoading(title string) {
 	u.table.SetCell(0, 0, tview.NewTableCell("Loading...").
 		SetSelectable(false).
 		SetTextColor(tcell.ColorGray))
+}
+
+func (u *UI) showFilterInput() {
+	u.filterMode = true
+	u.updateStatusBarText()
+
+	// Set initial text if filter exists
+	if !u.filter.IsEmpty() {
+		u.filterInput.SetText(u.filter.String())
+	}
+
+	u.mainView.Clear()
+	u.mainView.AddItem(u.table, 0, 1, false)
+	u.mainView.AddItem(u.filterInput, 3, 0, true)
+	u.mainView.AddItem(u.statusBar, 1, 0, false)
+
+	u.app.SetFocus(u.filterInput)
+}
+
+func (u *UI) hideFilterInput() {
+	u.filterMode = false
+	u.updateStatusBarText()
+
+	u.mainView.Clear()
+	u.mainView.AddItem(u.table, 0, 1, true)
+	u.mainView.AddItem(u.statusBar, 1, 0, false)
+
+	u.app.SetFocus(u.table)
+}
+
+func (u *UI) applyFilter() {
+	filterText := u.filterInput.GetText()
+
+	newFilter, err := filter.ParseFilter(filterText)
+	if err != nil {
+		u.statusBar.SetText(fmt.Sprintf("[red]Filter error: %v", err))
+		return
+	}
+
+	u.filter = newFilter
+	u.hideFilterInput()
+	u.reloadCurrentView()
+}
+
+func (u *UI) clearFilter() {
+	u.filter = filter.New()
+	u.filterInput.SetText("")
+	u.updateStatusBarText()
+	u.reloadCurrentView()
 }
 
 func (u *UI) reloadCurrentView() {
@@ -503,7 +598,16 @@ func (u *UI) renderContainers(containers []docker.ContainerInfo, err error, sele
 	}
 
 	u.containers = containers
-	headers := []string{"STATUS", "NAME", "IMAGE", "CPU", "MEMORY", "NET I/O", "PORTS"}
+
+	// Apply filters
+	filtered := make([]docker.ContainerInfo, 0, len(containers))
+	for _, c := range containers {
+		if u.filter.MatchContainer(c) {
+			filtered = append(filtered, c)
+		}
+	}
+
+	headers := []string{"STATUS", "NAME", "AGE", "IMAGE", "CPU", "MEMORY", "NET I/O", "PORTS"}
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
 			SetTextColor(tcell.ColorYellow).
@@ -513,7 +617,7 @@ func (u *UI) renderContainers(containers []docker.ContainerInfo, err error, sele
 			SetAttributes(tcell.AttrBold))
 	}
 
-	for i, c := range containers {
+	for i, c := range filtered {
 		statusSymbol := "●"
 		statusColor := tcell.ColorRed
 		if c.State == "running" {
@@ -530,24 +634,27 @@ func (u *UI) renderContainers(containers []docker.ContainerInfo, err error, sele
 		u.table.SetCell(row, 1, tview.NewTableCell(c.Name).
 			SetTextColor(tcell.ColorWhite).
 			SetExpansion(1))
-		u.table.SetCell(row, 2, tview.NewTableCell(c.Image).
-			SetTextColor(tcell.ColorLightBlue).
-			SetExpansion(1))
-		u.table.SetCell(row, 3, tview.NewTableCell(c.CPU).
-			SetTextColor(tcell.ColorAqua).
-			SetExpansion(1))
-		u.table.SetCell(row, 4, tview.NewTableCell(c.Memory).
-			SetTextColor(tcell.ColorAqua).
-			SetExpansion(1))
-		u.table.SetCell(row, 5, tview.NewTableCell(c.NetIO).
+		u.table.SetCell(row, 2, tview.NewTableCell(c.Age).
 			SetTextColor(tcell.ColorGray).
 			SetExpansion(1))
-		u.table.SetCell(row, 6, tview.NewTableCell(c.Ports).
+		u.table.SetCell(row, 3, tview.NewTableCell(c.Image).
+			SetTextColor(tcell.ColorLightBlue).
+			SetExpansion(1))
+		u.table.SetCell(row, 4, tview.NewTableCell(c.CPU).
+			SetTextColor(tcell.ColorAqua).
+			SetExpansion(1))
+		u.table.SetCell(row, 5, tview.NewTableCell(c.Memory).
+			SetTextColor(tcell.ColorAqua).
+			SetExpansion(1))
+		u.table.SetCell(row, 6, tview.NewTableCell(c.NetIO).
+			SetTextColor(tcell.ColorGray).
+			SetExpansion(1))
+		u.table.SetCell(row, 7, tview.NewTableCell(c.Ports).
 			SetTextColor(tcell.ColorGray).
 			SetExpansion(1))
 	}
 
-	u.restoreSelection(selectedRow, len(containers))
+	u.restoreSelection(selectedRow, len(filtered))
 }
 
 func (u *UI) renderImages(images []docker.ImageInfo, err error, selectedRow int) {
@@ -560,7 +667,16 @@ func (u *UI) renderImages(images []docker.ImageInfo, err error, selectedRow int)
 	}
 
 	u.images = images
-	headers := []string{"ID", "TAG", "SIZE", "CREATED"}
+
+	// Apply filters
+	filtered := make([]docker.ImageInfo, 0, len(images))
+	for _, img := range images {
+		if u.filter.MatchImage(img) {
+			filtered = append(filtered, img)
+		}
+	}
+
+	headers := []string{"ID", "TAG", "SIZE", "AGE"}
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
 			SetTextColor(tcell.ColorYellow).
@@ -570,7 +686,7 @@ func (u *UI) renderImages(images []docker.ImageInfo, err error, selectedRow int)
 			SetAttributes(tcell.AttrBold))
 	}
 
-	for i, img := range images {
+	for i, img := range filtered {
 		row := i + 1
 		u.table.SetCell(row, 0, tview.NewTableCell(img.ID).
 			SetTextColor(tcell.ColorWhite).
@@ -581,12 +697,12 @@ func (u *UI) renderImages(images []docker.ImageInfo, err error, selectedRow int)
 		u.table.SetCell(row, 2, tview.NewTableCell(img.Size).
 			SetTextColor(tcell.ColorGray).
 			SetExpansion(1))
-		u.table.SetCell(row, 3, tview.NewTableCell(img.Created).
+		u.table.SetCell(row, 3, tview.NewTableCell(img.Age).
 			SetTextColor(tcell.ColorGray).
 			SetExpansion(1))
 	}
 
-	u.restoreSelection(selectedRow, len(images))
+	u.restoreSelection(selectedRow, len(filtered))
 }
 
 func (u *UI) renderNetworks(networks []docker.NetworkInfo, err error, selectedRow int) {
@@ -599,7 +715,16 @@ func (u *UI) renderNetworks(networks []docker.NetworkInfo, err error, selectedRo
 	}
 
 	u.networks = networks
-	headers := []string{"ID", "NAME", "DRIVER", "SCOPE"}
+
+	// Apply filters
+	filtered := make([]docker.NetworkInfo, 0, len(networks))
+	for _, net := range networks {
+		if u.filter.MatchNetwork(net) {
+			filtered = append(filtered, net)
+		}
+	}
+
+	headers := []string{"ID", "NAME", "AGE", "DRIVER", "SCOPE"}
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
 			SetTextColor(tcell.ColorYellow).
@@ -609,7 +734,7 @@ func (u *UI) renderNetworks(networks []docker.NetworkInfo, err error, selectedRo
 			SetAttributes(tcell.AttrBold))
 	}
 
-	for i, net := range networks {
+	for i, net := range filtered {
 		row := i + 1
 		u.table.SetCell(row, 0, tview.NewTableCell(net.ID).
 			SetTextColor(tcell.ColorWhite).
@@ -617,15 +742,18 @@ func (u *UI) renderNetworks(networks []docker.NetworkInfo, err error, selectedRo
 		u.table.SetCell(row, 1, tview.NewTableCell(net.Name).
 			SetTextColor(tcell.ColorLightBlue).
 			SetExpansion(1))
-		u.table.SetCell(row, 2, tview.NewTableCell(net.Driver).
+		u.table.SetCell(row, 2, tview.NewTableCell(net.Age).
 			SetTextColor(tcell.ColorGray).
 			SetExpansion(1))
-		u.table.SetCell(row, 3, tview.NewTableCell(net.Scope).
+		u.table.SetCell(row, 3, tview.NewTableCell(net.Driver).
+			SetTextColor(tcell.ColorGray).
+			SetExpansion(1))
+		u.table.SetCell(row, 4, tview.NewTableCell(net.Scope).
 			SetTextColor(tcell.ColorGray).
 			SetExpansion(1))
 	}
 
-	u.restoreSelection(selectedRow, len(networks))
+	u.restoreSelection(selectedRow, len(filtered))
 }
 
 func (u *UI) renderVolumes(volumes []docker.VolumeInfo, err error, selectedRow int) {
@@ -638,7 +766,16 @@ func (u *UI) renderVolumes(volumes []docker.VolumeInfo, err error, selectedRow i
 	}
 
 	u.volumes = volumes
-	headers := []string{"NAME", "DRIVER", "MOUNTPOINT"}
+
+	// Apply filters
+	filtered := make([]docker.VolumeInfo, 0, len(volumes))
+	for _, vol := range volumes {
+		if u.filter.MatchVolume(vol) {
+			filtered = append(filtered, vol)
+		}
+	}
+
+	headers := []string{"NAME", "AGE", "DRIVER", "MOUNTPOINT"}
 	for col, header := range headers {
 		u.table.SetCell(0, col, tview.NewTableCell(header).
 			SetTextColor(tcell.ColorYellow).
@@ -648,20 +785,23 @@ func (u *UI) renderVolumes(volumes []docker.VolumeInfo, err error, selectedRow i
 			SetAttributes(tcell.AttrBold))
 	}
 
-	for i, vol := range volumes {
+	for i, vol := range filtered {
 		row := i + 1
 		u.table.SetCell(row, 0, tview.NewTableCell(vol.Name).
 			SetTextColor(tcell.ColorWhite).
 			SetExpansion(1))
-		u.table.SetCell(row, 1, tview.NewTableCell(vol.Driver).
+		u.table.SetCell(row, 1, tview.NewTableCell(vol.Age).
+			SetTextColor(tcell.ColorGray).
+			SetExpansion(1))
+		u.table.SetCell(row, 2, tview.NewTableCell(vol.Driver).
 			SetTextColor(tcell.ColorLightBlue).
 			SetExpansion(1))
-		u.table.SetCell(row, 2, tview.NewTableCell(vol.Mountpoint).
+		u.table.SetCell(row, 3, tview.NewTableCell(vol.Mountpoint).
 			SetTextColor(tcell.ColorGray).
 			SetExpansion(1))
 	}
 
-	u.restoreSelection(selectedRow, len(volumes))
+	u.restoreSelection(selectedRow, len(filtered))
 }
 
 func (u *UI) restoreSelection(selectedRow, total int) {

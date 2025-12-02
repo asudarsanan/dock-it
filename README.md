@@ -12,11 +12,21 @@ A fast, terminal-based Docker management tool inspired by k9s, built with Go.
 
 ### Container Operations
 - 📊 **Real-time Metrics**: CPU, Memory, and Network I/O stats
+- ⏱️ **Age Display**: See creation age for all resources (e.g., "2h ago", "3d ago")
+- 🔍 **Advanced Filtering**: Filter resources by age, status, name, size, and more
 - 📝 **Log Streaming**: View color-coded container logs with scrolling
-- 🔍 **Describe Resources**: Inspect containers, images, networks, and volumes via prettified JSON detail views
+- 🔎 **Describe Resources**: Inspect containers, images, networks, and volumes via prettified JSON detail views
 - 🖥️ **Shell Access**: Execute interactive shells into containers
 - ⚡ **Quick Actions**: Start, stop, restart, delete with single keystrokes
 - 🎨 **Status Indicators**: Color-coded container states (running=green, exited=red)
+
+### Filtering System
+- **Interactive Filter Bar**: Press `/` to open filter input
+- **Rich Query Language**: `age>1h`, `status=running`, `name~redis`, `size>100MB`
+- **Multiple Criteria**: Combine filters like `age>1d,state=running`
+- **Supported Operators**: `=`, `!=`, `>`, `<`, `>=`, `<=`, `~`, `!~`, `=~`
+- **Duration Support**: Hours (h), minutes (m), days (d), weeks (w), months (mo), years (y)
+- **Size Support**: B, KB, MB, GB, TB
 
 ### Performance
 - **Non-blocking UI**: Async operations with 2-second timeouts

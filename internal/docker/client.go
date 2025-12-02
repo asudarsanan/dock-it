@@ -29,15 +29,17 @@ type Client struct {
 
 // ContainerInfo holds display information for a single container.
 type ContainerInfo struct {
-	ID     string
-	Name   string
-	Image  string
-	Status string
-	State  string
-	Ports  string
-	CPU    string
-	Memory string
-	NetIO  string
+	ID      string
+	Name    string
+	Image   string
+	Status  string
+	State   string
+	Ports   string
+	Age     string
+	Created time.Time
+	CPU     string
+	Memory  string
+	NetIO   string
 }
 
 // ImageInfo holds display information for a Docker image.
@@ -45,15 +47,18 @@ type ImageInfo struct {
 	ID      string
 	Tag     string
 	Size    string
-	Created string
+	Age     string
+	Created time.Time
 }
 
 // NetworkInfo holds display information for a Docker network.
 type NetworkInfo struct {
-	ID     string
-	Name   string
-	Driver string
-	Scope  string
+	ID      string
+	Name    string
+	Driver  string
+	Scope   string
+	Age     string
+	Created time.Time
 }
 
 // VolumeInfo holds display information for a Docker volume.
@@ -61,6 +66,8 @@ type VolumeInfo struct {
 	Name       string
 	Driver     string
 	Mountpoint string
+	Age        string
+	Created    time.Time
 }
 
 // ContainerStats holds formatted resource usage statistics.
@@ -118,16 +125,21 @@ func (c *Client) ListContainers() ([]ContainerInfo, error) {
 			}
 		}
 
+		createdTime := time.Unix(ctr.Created, 0)
+		age := formatRelativeDuration(time.Since(createdTime))
+
 		info := ContainerInfo{
-			ID:     ctr.ID,
-			Name:   name,
-			Image:  ctr.Image,
-			Status: ctr.Status,
-			State:  ctr.State,
-			Ports:  ports,
-			CPU:    "-",
-			Memory: "-",
-			NetIO:  "-",
+			ID:      ctr.ID,
+			Name:    name,
+			Image:   ctr.Image,
+			Status:  ctr.Status,
+			State:   ctr.State,
+			Ports:   ports,
+			Age:     age,
+			Created: createdTime,
+			CPU:     "-",
+			Memory:  "-",
+			NetIO:   "-",
 		}
 		result = append(result, info)
 
@@ -289,13 +301,15 @@ func (c *Client) ListImages() ([]ImageInfo, error) {
 		}
 
 		size := fmt.Sprintf("%.2f MB", float64(img.Size)/(1024*1024))
-		created := formatRelativeDuration(time.Since(time.Unix(img.Created, 0)))
+		createdTime := time.Unix(img.Created, 0)
+		age := formatRelativeDuration(time.Since(createdTime))
 
 		info := ImageInfo{
 			ID:      shortImageID(img.ID),
 			Tag:     tag,
 			Size:    size,
-			Created: created,
+			Age:     age,
+			Created: createdTime,
 		}
 		result = append(result, info)
 	}
@@ -318,11 +332,19 @@ func (c *Client) ListNetworks() ([]NetworkInfo, error) {
 		if len(id) > 12 {
 			id = id[:12]
 		}
+
+		// Docker network API doesn't always provide Created timestamp
+		// Set age to "-" as it's not reliably available
+		age := "-"
+		var createdTime time.Time
+
 		info := NetworkInfo{
-			ID:     id,
-			Name:   net.Name,
-			Driver: net.Driver,
-			Scope:  net.Scope,
+			ID:      id,
+			Name:    net.Name,
+			Driver:  net.Driver,
+			Scope:   net.Scope,
+			Age:     age,
+			Created: createdTime,
 		}
 		result = append(result, info)
 	}
@@ -341,10 +363,26 @@ func (c *Client) ListVolumes() ([]VolumeInfo, error) {
 
 	var result []VolumeInfo
 	for _, vol := range volumes.Volumes {
+		// Parse CreatedAt timestamp if available
+		var createdTime time.Time
+		var age string
+		if vol.CreatedAt != "" {
+			if parsed, err := time.Parse(time.RFC3339Nano, vol.CreatedAt); err == nil {
+				createdTime = parsed
+				age = formatRelativeDuration(time.Since(createdTime))
+			} else {
+				age = "-"
+			}
+		} else {
+			age = "-"
+		}
+
 		info := VolumeInfo{
 			Name:       vol.Name,
 			Driver:     vol.Driver,
 			Mountpoint: vol.Mountpoint,
+			Age:        age,
+			Created:    createdTime,
 		}
 		result = append(result, info)
 	}
